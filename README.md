@@ -1,10 +1,13 @@
+想使用多IP 需要自己在服务器把ip添加到网卡
+
+
 #  **域名查询工具 - 命令行参数大全**
 
 ## **1. 基本查询**
 
 
 
-**# 查询默认TLD (de, im, pw)**
+**# 查询默认TLD (tk, cf, de)**
 
 python3 domain\_checker\_ipv6.py 2字母.txt
 
@@ -235,6 +238,7 @@ dictionary	字典文件路径	必填	2字母.txt
 --no-cache	不使用缓存	False	--no-cache
 
 --no-color	禁用颜色	False	--no-color
+
 
 
 
