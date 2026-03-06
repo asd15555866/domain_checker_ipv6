@@ -23,7 +23,7 @@ from collections import defaultdict
 from datetime import datetime
 
 # ==================== 配置区域 ====================
-TLDS = ['de', 'im', 'pw']        # 要查询的顶级域
+TLDS = ['de', 'tk', 'cf']        # 要查询的顶级域
 CACHE_FILE = 'checked_cache.txt'  # 缓存文件
 TIMEOUT_FILE = '超时域名汇总.txt'  # 超时域名汇总文件
 # OUTPUT_FILES 将在 main 中根据字典名和TLD动态生成
