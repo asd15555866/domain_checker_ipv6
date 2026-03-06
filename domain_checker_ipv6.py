@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-高性能域名批量查询工具 - IPv6多IP并发版（最终版）
+高性能域名批量查询工具 - IPv6多IP并发版（自适应限流版）
 为每个线程分配不同的IPv6源地址，突破限流
+自动检测本机IPv6前缀，无需手动配置
 输出文件名自动根据字典名和TLD生成：字典名-TLD可注册.txt
 内存占用: ~50-80MB (取决于并发数)
 """
@@ -14,6 +15,7 @@ import subprocess
 import argparse
 import random
 import threading
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -21,15 +23,22 @@ from pathlib import Path
 TLDS = ['de', 'im', 'pw']        # 要查询的顶级域
 CACHE_FILE = 'checked_cache.txt'  # 缓存文件
 # OUTPUT_FILE 将在 main 中根据字典名和TLD动态生成
-MAX_WORKERS = 20                   # 默认并发线程数 (IPv6多IP可以开更多)
+MAX_WORKERS = 20                   # 默认并发线程数
+MIN_WORKERS = 3                     # 最小并发线程数（限流时降低到多少）
 BASE_DELAY = 1.0                   # 基础延迟(秒)
 MAX_DELAY = 30.0                   # 最大延迟(秒，被限流时自动增加)
 REQUEST_TIMEOUT = 15                # WHOIS查询超时(秒)
 MAX_RETRIES = 3                     # 最大重试次数
 
-# IPv6 配置
-IPV6_PREFIX = "2a01:4f9:6b:fa53"   # 你的IPv6前缀
-IPV6_INTERFACE = "eth0"             # 网卡名称
+# 自适应限流配置
+RATE_LIMIT_THRESHOLD = 10           # 连续超时/限流多少次触发降速
+RATE_CHECK_INTERVAL = 50            # 每检查多少个域名检测一次限流情况
+WORKER_REDUCE_FACTOR = 0.7          # 并发数降低系数 (降低30%)
+DELAY_INCREASE_FACTOR = 1.5         # 延迟增加系数 (增加50%)
+
+# IPv6 配置（将自动检测，无需手动设置）
+IPV6_PREFIX = None                  # 将在 init_ipv6() 中自动检测
+IPV6_INTERFACE = None                # 将在 init_ipv6() 中自动检测
 USE_IPV6 = True                     # 是否使用IPv6
 # =================================================
 
@@ -37,6 +46,13 @@ USE_IPV6 = True                     # 是否使用IPv6
 file_lock = threading.Lock()
 # IPv6地址池锁
 ipv6_lock = threading.Lock()
+# 自适应限流相关锁和变量
+rate_limit_lock = threading.Lock()
+consecutive_timeouts = 0
+total_timeouts = 0
+current_workers = MAX_WORKERS
+current_delay = BASE_DELAY
+
 # 当前已分配的IPv6索引
 current_ip_index = 0
 max_ip_index = 1000  # 最多使用1000个不同IP（可以根据需要调整）
@@ -56,9 +72,100 @@ class Colors:
 
 colors = Colors()
 
+def detect_ipv6_prefix():
+    """自动检测本机的IPv6前缀和网卡"""
+    global IPV6_PREFIX, IPV6_INTERFACE
+    
+    try:
+        # 获取所有IPv6地址
+        result = subprocess.run(
+            ['ip', '-6', 'addr', 'show'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if result.returncode != 0:
+            print(f"{colors.YELLOW}[警告]{colors.RESET} 无法获取IPv6地址")
+            return False
+        
+        output = result.stdout
+        
+        # 查找全局IPv6地址（不是fe80开头的本地链路地址）
+        # 匹配模式：inet6 2001:db8:1234:5678::1/64 scope global
+        pattern = r'inet6\s+([a-f0-9:]+)(?:/\d+)?\s+scope\s+global'
+        matches = re.findall(pattern, output, re.IGNORECASE)
+        
+        if not matches:
+            print(f"{colors.YELLOW}[警告]{colors.RESET} 没有找到全局IPv6地址")
+            return False
+        
+        # 使用第一个全局IPv6地址
+        ipv6_addr = matches[0]
+        
+        # 提取前缀（去掉最后的::1或类似部分）
+        # 如果是 2a01:4f9:6b:1234::1 这种格式
+        if '::' in ipv6_addr:
+            prefix_parts = ipv6_addr.split('::')[0]
+            # 确保是64位前缀（通常前4段）
+            parts = prefix_parts.split(':')
+            if len(parts) >= 4:
+                IPV6_PREFIX = ':'.join(parts[:4])
+            else:
+                IPV6_PREFIX = prefix_parts
+        else:
+            # 如果是完整地址，取前4段
+            parts = ipv6_addr.split(':')
+            if len(parts) >= 4:
+                IPV6_PREFIX = ':'.join(parts[:4])
+            else:
+                IPV6_PREFIX = ipv6_addr
+        
+        # 获取默认网卡
+        # 查找有默认路由的网卡
+        route_result = subprocess.run(
+            ['ip', '-6', 'route', 'show', 'default'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if route_result.returncode == 0:
+            # 匹配 dev eth0 这种格式
+            dev_match = re.search(r'dev\s+(\S+)', route_result.stdout)
+            if dev_match:
+                IPV6_INTERFACE = dev_match.group(1)
+            else:
+                # 如果没有默认路由，用第一个有IPv6的网卡
+                interface_pattern = r'\d+:\s+(\S+):'
+                iface_match = re.search(interface_pattern, output)
+                if iface_match:
+                    IPV6_INTERFACE = iface_match.group(1)
+                else:
+                    IPV6_INTERFACE = 'eth0'  # 默认
+        else:
+            # 如果没有默认路由，用第一个有IPv6的网卡
+            interface_pattern = r'\d+:\s+(\S+):'
+            iface_match = re.search(interface_pattern, output)
+            if iface_match:
+                IPV6_INTERFACE = iface_match.group(1)
+            else:
+                IPV6_INTERFACE = 'eth0'  # 默认
+        
+        print(f"{colors.GREEN}[IPv6]{colors.RESET} 自动检测到前缀: {IPV6_PREFIX}")
+        print(f"{colors.GREEN}[IPv6]{colors.RESET} 自动检测到网卡: {IPV6_INTERFACE}")
+        return True
+        
+    except Exception as e:
+        print(f"{colors.YELLOW}[警告]{colors.RESET} 自动检测IPv6失败: {e}")
+        return False
+
 def get_next_ipv6():
     """获取下一个可用的IPv6地址（线程安全）"""
     global current_ip_index
+    
+    if not IPV6_PREFIX:
+        return None
     
     with ipv6_lock:
         # 生成IPv6地址的后64位（接口标识）
@@ -76,6 +183,9 @@ def get_next_ipv6():
 
 def check_ipv6_available():
     """检查IPv6是否可用"""
+    if not IPV6_PREFIX:
+        return False
+    
     try:
         # 尝试执行IPv6 ping测试
         result = subprocess.run(
@@ -92,6 +202,7 @@ class Counter:
     def __init__(self):
         self.checked = 0
         self.available = 0
+        self.timeout_count = 0
         self.lock = threading.Lock()
         self.start_time = time.time()
     
@@ -105,9 +216,14 @@ class Counter:
             self.available += 1
             return self.available
     
+    def add_timeout(self):
+        with self.lock:
+            self.timeout_count += 1
+            return self.timeout_count
+    
     def get(self):
         with self.lock:
-            return self.checked, self.available
+            return self.checked, self.available, self.timeout_count
     
     def get_speed(self):
         with self.lock:
@@ -117,6 +233,56 @@ class Counter:
             return 0
 
 counter = Counter()
+
+def check_rate_limit():
+    """检测限流情况，必要时调整并发数和延迟"""
+    global current_workers, current_delay, consecutive_timeouts
+    
+    with rate_limit_lock:
+        # 如果连续超时超过阈值，触发降速
+        if consecutive_timeouts >= RATE_LIMIT_THRESHOLD:
+            old_workers = current_workers
+            old_delay = current_delay
+            
+            # 降低并发数（不低于最小值）
+            new_workers = max(int(current_workers * WORKER_REDUCE_FACTOR), MIN_WORKERS)
+            
+            # 增加延迟（不超过最大值）
+            new_delay = min(current_delay * DELAY_INCREASE_FACTOR, MAX_DELAY)
+            
+            # 更新配置
+            current_workers = new_workers
+            current_delay = new_delay
+            
+            print(f"\n{colors.MAGENTA}{'=' * 60}{colors.RESET}")
+            print(f"{colors.BOLD}{colors.YELLOW}[自适应限流]{colors.RESET} 检测到连续 {consecutive_timeouts} 次超时")
+            print(f"{colors.YELLOW}调整前:{colors.RESET} 并发 {old_workers}, 延迟 {old_delay:.1f}秒")
+            print(f"{colors.GREEN}调整后:{colors.RESET} 并发 {new_workers}, 延迟 {new_delay:.1f}秒")
+            print(f"{colors.MAGENTA}{'=' * 60}{colors.RESET}\n")
+            
+            # 重置计数器
+            consecutive_timeouts = 0
+            
+            return True
+        return False
+
+def record_timeout():
+    """记录一次超时，并检查是否需要降速"""
+    global consecutive_timeouts
+    
+    with rate_limit_lock:
+        consecutive_timeouts += 1
+        total_timeouts = counter.add_timeout()
+    
+    # 每检查一定数量域名后，检测限流情况
+    checked = counter.checked
+    if checked % RATE_CHECK_INTERVAL == 0:
+        check_rate_limit()
+
+def get_current_config():
+    """获取当前配置（线程安全）"""
+    with rate_limit_lock:
+        return current_workers, current_delay
 
 def load_dictionary(dict_file):
     """从文件加载字典前缀"""
@@ -166,9 +332,9 @@ def save_available(domain, output_file):
 def check_domain_with_ipv6(domain, source_ip):
     """
     使用指定IPv6源地址查询域名
-    包含完整的防封机制
+    包含完整的防封机制和自适应限流
     """
-    current_delay = BASE_DELAY
+    workers, delay = get_current_config()
     
     for attempt in range(MAX_RETRIES):
         try:
@@ -198,8 +364,11 @@ def check_domain_with_ipv6(domain, source_ip):
             for indicator in limit_indicators:
                 if indicator in output:
                     if attempt < MAX_RETRIES - 1:
+                        # 记录限流事件
+                        record_timeout()
+                        
                         # 指数退避：被限流时等待更长时间
-                        wait_time = current_delay * (2 ** attempt)
+                        wait_time = delay * (2 ** attempt)
                         wait_time = min(wait_time, MAX_DELAY)
                         
                         print(f"{colors.YELLOW}[限流]{colors.RESET} {domain} "
@@ -210,6 +379,7 @@ def check_domain_with_ipv6(domain, source_ip):
                     else:
                         print(f"{colors.RED}[限流]{colors.RESET} {domain} "
                               f"重试{MAX_RETRIES}次仍失败，跳过")
+                        record_timeout()  # 记录失败
                         return False
             
             # ========== 规则1: 明确的未注册关键词 ==========
@@ -282,9 +452,12 @@ def check_domain_with_ipv6(domain, source_ip):
             return False
             
         except subprocess.TimeoutExpired:
-            # 超时保护
+            # 记录超时事件
+            record_timeout()
+            
             if attempt < MAX_RETRIES - 1:
-                wait_time = current_delay * (2 ** attempt)
+                workers, delay = get_current_config()  # 重新获取最新配置
+                wait_time = delay * (2 ** attempt)
                 wait_time = min(wait_time, MAX_DELAY)
                 print(f"{colors.YELLOW}[超时]{colors.RESET} {domain} (IP: {source_ip}) "
                       f"查询超时，等待 {wait_time:.1f}秒后重试 ({attempt+1}/{MAX_RETRIES})")
@@ -295,8 +468,11 @@ def check_domain_with_ipv6(domain, source_ip):
                 return False
                 
         except Exception as e:
+            record_timeout()
+            
             if attempt < MAX_RETRIES - 1:
-                wait_time = current_delay * (2 ** attempt)
+                workers, delay = get_current_config()
+                wait_time = delay * (2 ** attempt)
                 wait_time = min(wait_time, MAX_DELAY)
                 print(f"{colors.YELLOW}[错误]{colors.RESET} {domain} (IP: {source_ip}) - {str(e)[:50]}，"
                       f"等待 {wait_time:.1f}秒后重试 ({attempt+1}/{MAX_RETRIES})")
@@ -311,7 +487,7 @@ def check_domain_with_ipv6(domain, source_ip):
 def worker(domain, output_file):
     """单个域名查询工作线程（使用不同IPv6源地址）"""
     # 为这个线程分配一个IPv6源地址
-    source_ip = get_next_ipv6()
+    source_ip = get_next_ipv6() if USE_IPV6 else "IPv6禁用"
     
     try:
         is_available = check_domain_with_ipv6(domain, source_ip)
@@ -333,6 +509,9 @@ def worker(domain, output_file):
         available = counter.available
         status = f"{colors.RED}不可用{colors.RESET}"
     
+    # 获取当前配置用于显示
+    workers, delay = get_current_config()
+    
     # 打印进度（每10个或发现可用时打印）
     if checked % 10 == 0 or is_available:
         speed = counter.get_speed()
@@ -344,54 +523,64 @@ def worker(domain, output_file):
         else:
             eta_str = ""
         
+        _, _, timeouts = counter.get()
+        
+        ip_info = f"[{source_ip}]" if USE_IPV6 else ""
+        
         print(f"{colors.BLUE}[{checked}/{total_domains}]{colors.RESET} "
-              f"{domain} [{source_ip}] - {status} "
+              f"{domain} {ip_info} - {status} "
               f"(可用: {colors.GREEN}{available}{colors.RESET}"
-              f"{colors.CYAN}{eta_str}{colors.RESET})")
+              f"{colors.CYAN}{eta_str}{colors.RESET}) "
+              f"[并发:{workers} 延迟:{delay:.1f}s 超时:{timeouts}]")
 
-def setup_ipv6_routing():
-    """配置IPv6路由策略，确保源地址正确使用"""
-    print(f"{colors.CYAN}[IPv6]{colors.RESET} 检查IPv6配置...")
+def init_ipv6():
+    """初始化IPv6配置"""
+    global USE_IPV6, IPV6_PREFIX, IPV6_INTERFACE
     
-    try:
-        # 检查IPv6是否可用
-        if not check_ipv6_available():
-            print(f"{colors.YELLOW}[警告]{colors.RESET} IPv6网络可能不可用，将尝试继续")
-        
-        # 检查网卡是否存在
-        result = subprocess.run(['ip', 'link', 'show', IPV6_INTERFACE], 
-                               capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"{colors.RED}[错误]{colors.RESET} 网卡 {IPV6_INTERFACE} 不存在")
-            return False
-        
-        # 检查是否已有IPv6地址
-        result = subprocess.run(['ip', '-6', 'addr', 'show', 'dev', IPV6_INTERFACE], 
-                               capture_output=True, text=True)
-        
-        ipv6_count = result.stdout.count(IPV6_PREFIX)
-        print(f"{colors.GREEN}[IPv6]{colors.RESET} 当前接口已有 {ipv6_count} 个IPv6地址")
-        
-        if ipv6_count == 0:
-            print(f"{colors.YELLOW}[警告]{colors.RESET} 没有找到IPv6地址，请先运行 add-ipv6.sh")
-            return False
-        
-        print(f"{colors.GREEN}[IPv6]{colors.RESET} 配置完成，可以使用多IP查询")
-        return True
-        
-    except Exception as e:
-        print(f"{colors.RED}[错误]{colors.RESET} 配置IPv6失败: {e}")
+    if not USE_IPV6:
         return False
+    
+    print(f"{colors.CYAN}[IPv6]{colors.RESET} 正在自动检测IPv6配置...")
+    
+    # 自动检测IPv6前缀和网卡
+    if not detect_ipv6_prefix():
+        print(f"{colors.YELLOW}[警告]{colors.RESET} 自动检测IPv6失败，将使用普通模式")
+        USE_IPV6 = False
+        return False
+    
+    # 检查IPv6网络是否可用
+    if not check_ipv6_available():
+        print(f"{colors.YELLOW}[警告]{colors.RESET} IPv6网络可能不可用，将尝试继续")
+    
+    # 检查是否已有IPv6地址
+    result = subprocess.run(
+        ['ip', '-6', 'addr', 'show', 'dev', IPV6_INTERFACE], 
+        capture_output=True, 
+        text=True
+    )
+    
+    ipv6_count = result.stdout.count(IPV6_PREFIX)
+    print(f"{colors.GREEN}[IPv6]{colors.RESET} 当前接口已有 {ipv6_count} 个IPv6地址")
+    
+    if ipv6_count == 0:
+        print(f"{colors.YELLOW}[警告]{colors.RESET} 没有找到IPv6地址，请先运行 add-ipv6.sh")
+        return False
+    
+    print(f"{colors.GREEN}[IPv6]{colors.RESET} 配置完成，可以使用多IP查询")
+    return True
 
 def main():
     global total_domains, max_ip_index, BASE_DELAY, MAX_DELAY, REQUEST_TIMEOUT, MAX_RETRIES, USE_IPV6
+    global current_workers, current_delay
     
-    parser = argparse.ArgumentParser(description='高性能域名批量查询工具 - IPv6多IP并发版')
+    parser = argparse.ArgumentParser(description='高性能域名批量查询工具 - IPv6多IP并发版（自适应限流）')
     parser.add_argument('dictionary', help='字典文件路径 (每行一个前缀)')
     parser.add_argument('--tld', nargs='+', default=TLDS, 
                        help=f'指定TLD，默认: {TLDS}')
     parser.add_argument('--workers', type=int, default=MAX_WORKERS,
-                       help=f'并发线程数，默认: {MAX_WORKERS}')
+                       help=f'初始并发线程数，默认: {MAX_WORKERS}')
+    parser.add_argument('--min-workers', type=int, default=MIN_WORKERS,
+                       help=f'最小并发线程数，默认: {MIN_WORKERS}')
     parser.add_argument('--delay', type=float, default=BASE_DELAY,
                        help=f'基础延迟(秒)，默认: {BASE_DELAY}')
     parser.add_argument('--max-delay', type=float, default=MAX_DELAY,
@@ -402,6 +591,8 @@ def main():
                        help=f'最大重试次数，默认: {MAX_RETRIES}')
     parser.add_argument('--max-ips', type=int, default=1000,
                        help=f'最大使用IPv6数量，默认: 1000')
+    parser.add_argument('--threshold', type=int, default=RATE_LIMIT_THRESHOLD,
+                       help=f'限流触发阈值（连续超时次数），默认: {RATE_LIMIT_THRESHOLD}')
     parser.add_argument('--no-ipv6', action='store_true',
                        help='禁用IPv6多IP功能')
     parser.add_argument('--no-cache', action='store_true',
@@ -417,11 +608,16 @@ def main():
     OUTPUT_FILE = f"{dict_name}-{tld_str}可注册.txt"
     
     # 更新配置
+    global MIN_WORKERS, RATE_LIMIT_THRESHOLD
+    MIN_WORKERS = args.min_workers
+    RATE_LIMIT_THRESHOLD = args.threshold
     max_ip_index = args.max_ips
     BASE_DELAY = args.delay
     MAX_DELAY = args.max_delay
     REQUEST_TIMEOUT = args.timeout
     MAX_RETRIES = args.retries
+    current_workers = args.workers
+    current_delay = BASE_DELAY
     
     if args.no_ipv6:
         USE_IPV6 = False
@@ -430,18 +626,19 @@ def main():
         colors.supported = False
         colors.__init__()
     
-    max_workers = args.workers
+    max_workers = current_workers  # 初始并发数
     use_cache = not args.no_cache
     
     # 打印配置
     separator = f"{colors.BLUE}{'=' * 80}{colors.RESET}"
     print(separator)
-    print(f"{colors.BOLD}{colors.CYAN}高性能域名批量查询工具 - IPv6多IP并发版{colors.RESET}")
+    print(f"{colors.BOLD}{colors.CYAN}高性能域名批量查询工具 - IPv6多IP并发版（自适应限流）{colors.RESET}")
     print(f"{colors.YELLOW}字典文件:{colors.RESET} {args.dictionary}")
     print(f"{colors.YELLOW}输出文件:{colors.RESET} {OUTPUT_FILE}")
     print(f"{colors.YELLOW}查询TLD:{colors.RESET} {tlds}")
-    print(f"{colors.YELLOW}并发线程:{colors.RESET} {max_workers}")
-    print(f"{colors.YELLOW}IPv6前缀:{colors.RESET} {IPV6_PREFIX}")
+    print(f"{colors.YELLOW}初始并发:{colors.RESET} {max_workers}")
+    print(f"{colors.YELLOW}最小并发:{colors.RESET} {MIN_WORKERS}")
+    print(f"{colors.YELLOW}限流阈值:{colors.RESET} {RATE_LIMIT_THRESHOLD}次超时")
     print(f"{colors.YELLOW}最大IPv6数:{colors.RESET} {max_ip_index}")
     print(f"{colors.YELLOW}基础延迟:{colors.RESET} {BASE_DELAY}秒")
     print(f"{colors.YELLOW}最大延迟:{colors.RESET} {MAX_DELAY}秒")
@@ -450,11 +647,9 @@ def main():
     print(f"{colors.YELLOW}使用缓存:{colors.RESET} {use_cache}")
     print(separator)
     
-    # 配置IPv6（如果启用）
+    # 初始化IPv6
     if USE_IPV6:
-        if not setup_ipv6_routing():
-            print(f"{colors.YELLOW}[警告]{colors.RESET} IPv6配置失败，将使用普通模式")
-            USE_IPV6 = False
+        USE_IPV6 = init_ipv6()
     
     # 加载数据
     prefixes = load_dictionary(args.dictionary)
@@ -495,13 +690,16 @@ def main():
     
     finally:
         total_time = time.time() - start_time
-        checked, available = counter.get()
+        checked, available, timeouts = counter.get()
         speed = checked / total_time if total_time > 0 else 0
         
         print("\n" + separator)
         print(f"{colors.BOLD}{colors.GREEN}查询完成{colors.RESET}")
         print(f"{colors.CYAN}总共检查:{colors.RESET} {colors.BOLD}{checked}{colors.RESET} 个域名")
         print(f"{colors.CYAN}发现可用:{colors.RESET} {colors.BOLD}{colors.GREEN}{available}{colors.RESET} 个域名")
+        print(f"{colors.CYAN}超时/限流:{colors.RESET} {colors.BOLD}{timeouts}{colors.RESET} 次")
+        print(f"{colors.CYAN}最终并发:{colors.RESET} {colors.BOLD}{current_workers}{colors.RESET}")
+        print(f"{colors.CYAN}最终延迟:{colors.RESET} {colors.BOLD}{current_delay:.1f}{colors.RESET}秒")
         print(f"{colors.CYAN}总耗时:{colors.RESET} {colors.BOLD}{total_time/60:.1f}{colors.RESET} 分钟")
         print(f"{colors.CYAN}平均速度:{colors.RESET} {colors.BOLD}{speed:.2f}{colors.RESET} 个/秒")
         print(f"{colors.CYAN}可用域名已保存到:{colors.RESET} {OUTPUT_FILE}")
