@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-高性能域名批量查询工具 - IPv6多IP并发版（TLD级自适应限流）
-为每个线程分配不同的IPv6源地址，突破限流
-自动检测本机IPv6前缀，无需手动配置
-输出文件按TLD分别保存：字典名-TLD可注册.txt
-并在每个输出文件末尾添加超时域名列表
-内存占用: ~50-80MB (取决于并发数)
+高性能域名批量查询工具 - IPv6多IP并发版（全局特征码匹配版）
+只要WHOIS返回信息中包含以下任何一个英文关键词，就判定为可注册：
+- status: free
+- status: available
+- no match
+- no entries found
+- not found
+- domain not found
+- no object found
+- not registered
+- no data found
+- no matching record
+- is free
+- is available
+- no information available
+- the queried object does not exist
 """
 
 import os
@@ -23,52 +33,80 @@ from collections import defaultdict
 from datetime import datetime
 
 # ==================== 配置区域 ====================
-TLDS = ['de', 'tk', 'cf']        # 要查询的顶级域
+TLDS = ['de', 'im', 'pw']        # 要查询的顶级域
 CACHE_FILE = 'checked_cache.txt'  # 缓存文件
-TIMEOUT_FILE = '超时域名汇总.txt'  # 超时域名汇总文件
-# OUTPUT_FILES 将在 main 中根据字典名和TLD动态生成
-MAX_WORKERS = 16                   # 默认并发线程数
-MIN_WORKERS = 1                     # 最小并发线程数（限流时降低到多少）
-BASE_DELAY = 2.0                   # 基础延迟(秒)
-MAX_DELAY = 30.0                   # 最大延迟(秒，被限流时自动增加）
+TIMEOUT_FILE = 'timeout_domains.txt'  # 超时域名汇总文件
+MAX_WORKERS = 20                   # 默认并发线程数
+MIN_WORKERS = 3                     # 最小并发线程数
+BASE_DELAY = 1.0                   # 基础延迟(秒)
+MAX_DELAY = 30.0                   # 最大延迟(秒)
 REQUEST_TIMEOUT = 15                # WHOIS查询超时(秒)
-MAX_RETRIES = 3                     # 最大重试次数
+MAX_RETRIES = 3                     # 每个IP的最大重试次数
+MAX_IP_SWITCH = 3                   # 最大IP切换次数
 
 # 自适应限流配置
-RATE_LIMIT_THRESHOLD = 10           # 连续超时/限流多少次触发降速
-RATE_CHECK_INTERVAL = 50            # 每检查多少个域名检测一次限流情况
-WORKER_REDUCE_FACTOR = 0.5          # 并发数降低系数 (降低50%)
-DELAY_INCREASE_FACTOR = 2.0         # 延迟增加系数 (增加100%）
+RATE_LIMIT_THRESHOLD = 3            # 连续限流多少次触发降速
+RATE_CHECK_INTERVAL = 10
+WORKER_REDUCE_FACTOR = 0.7
+DELAY_INCREASE_FACTOR = 1.5
 
-# IPv6 配置（将自动检测，无需手动设置）
-IPV6_PREFIX = None                  # 将在 init_ipv6() 中自动检测
-IPV6_INTERFACE = None                # 将在 init_ipv6() 中自动检测
-USE_IPV6 = True                     # 是否使用IPv6
+# IPv6 配置
+IPV6_PREFIX = None
+IPV6_INTERFACE = None
+USE_IPV6 = True
 # =================================================
 
-# 线程锁，用于保护文件写入
-file_locks = defaultdict(threading.Lock)  # 每个文件有自己的锁
-# IPv6地址池锁
+# ==================== 全局可注册关键词特征码 ====================
+# 只要WHOIS返回信息中包含以下任何一个英文关键词，就判定为可注册
+AVAILABLE_KEYWORDS = [
+    'status: free',
+    'status: available',
+    'no match',
+    'no entries found',
+    'not found',
+    'domain not found',
+    'no object found',
+    'not registered',
+    'no data found',
+    'no matching record',
+    'is free',
+    'is available',
+    'no information available',
+    'the queried object does not exist',
+    'no match for',
+    'no entries',
+    'not found:',
+    '%% not found',
+    'error:101: no entries found',
+    'is available for registration',
+]
+# =================================================
+
+# 线程锁
+file_locks = defaultdict(threading.Lock)
 ipv6_lock = threading.Lock()
-# 自适应限流相关锁和变量 - 改为每个TLD单独统计
 rate_limit_lock = threading.Lock()
+timeout_domains_lock = threading.Lock()
+
+# TLD统计
 tld_stats = defaultdict(lambda: {
     'consecutive_timeouts': 0,
     'total_timeouts': 0,
     'current_workers': MAX_WORKERS,
     'current_delay': BASE_DELAY,
-    'checked_count': 0
+    'checked_count': 0,
+    'rate_limit_count': 0
 })
 
-# 超时域名记录（线程安全）
-timeout_domains_lock = threading.Lock()
-timeout_domains = defaultdict(list)  # 按TLD记录超时域名
+# 超时域名记录
+timeout_domains = defaultdict(list)
 
-# 当前已分配的IPv6索引
+# IPv6地址池
+ipv6_addresses = []
 current_ip_index = 0
-max_ip_index = 1000  # 最多使用1000个不同IP（可以根据需要调整）
+max_ip_index = 1000
 
-# 颜色定义 - 自动检测终端支持
+# 颜色定义
 class Colors:
     def __init__(self):
         self.supported = hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
@@ -83,12 +121,24 @@ class Colors:
 
 colors = Colors()
 
+def check_domain_available(output):
+    """
+    根据全局关键词判断域名是否可注册
+    只要WHOIS返回信息中包含任何一个关键词，就返回True
+    """
+    output_lower = output.lower()
+    
+    for keyword in AVAILABLE_KEYWORDS:
+        if keyword.lower() in output_lower:
+            return True
+    
+    return False
+
 def detect_ipv6_prefix():
     """自动检测本机的IPv6前缀和网卡"""
-    global IPV6_PREFIX, IPV6_INTERFACE
+    global IPV6_PREFIX, IPV6_INTERFACE, ipv6_addresses, max_ip_index
     
     try:
-        # 获取所有IPv6地址
         result = subprocess.run(
             ['ip', '-6', 'addr', 'show'],
             capture_output=True,
@@ -102,8 +152,6 @@ def detect_ipv6_prefix():
         
         output = result.stdout
         
-        # 查找全局IPv6地址（不是fe80开头的本地链路地址）
-        # 匹配模式：inet6 2001:db8:1234:5678::1/64 scope global
         pattern = r'inet6\s+([a-f0-9:]+)(?:/\d+)?\s+scope\s+global'
         matches = re.findall(pattern, output, re.IGNORECASE)
         
@@ -111,29 +159,22 @@ def detect_ipv6_prefix():
             print(f"{colors.YELLOW}[警告]{colors.RESET} 没有找到全局IPv6地址")
             return False
         
-        # 使用第一个全局IPv6地址
         ipv6_addr = matches[0]
         
-        # 提取前缀（去掉最后的::1或类似部分）
-        # 如果是 2a01:4f9:6b:1234::1 这种格式
         if '::' in ipv6_addr:
             prefix_parts = ipv6_addr.split('::')[0]
-            # 确保是64位前缀（通常前4段）
             parts = prefix_parts.split(':')
             if len(parts) >= 4:
                 IPV6_PREFIX = ':'.join(parts[:4])
             else:
                 IPV6_PREFIX = prefix_parts
         else:
-            # 如果是完整地址，取前4段
             parts = ipv6_addr.split(':')
             if len(parts) >= 4:
                 IPV6_PREFIX = ':'.join(parts[:4])
             else:
                 IPV6_PREFIX = ipv6_addr
         
-        # 获取默认网卡
-        # 查找有默认路由的网卡
         route_result = subprocess.run(
             ['ip', '-6', 'route', 'show', 'default'],
             capture_output=True,
@@ -142,54 +183,56 @@ def detect_ipv6_prefix():
         )
         
         if route_result.returncode == 0:
-            # 匹配 dev eth0 这种格式
             dev_match = re.search(r'dev\s+(\S+)', route_result.stdout)
             if dev_match:
                 IPV6_INTERFACE = dev_match.group(1)
             else:
-                # 如果没有默认路由，用第一个有IPv6的网卡
                 interface_pattern = r'\d+:\s+(\S+):'
                 iface_match = re.search(interface_pattern, output)
                 if iface_match:
                     IPV6_INTERFACE = iface_match.group(1)
                 else:
-                    IPV6_INTERFACE = 'eth0'  # 默认
+                    IPV6_INTERFACE = 'eth0'
         else:
-            # 如果没有默认路由，用第一个有IPv6的网卡
             interface_pattern = r'\d+:\s+(\S+):'
             iface_match = re.search(interface_pattern, output)
             if iface_match:
                 IPV6_INTERFACE = iface_match.group(1)
             else:
-                IPV6_INTERFACE = 'eth0'  # 默认
+                IPV6_INTERFACE = 'eth0'
         
         print(f"{colors.GREEN}[IPv6]{colors.RESET} 自动检测到前缀: {IPV6_PREFIX}")
         print(f"{colors.GREEN}[IPv6]{colors.RESET} 自动检测到网卡: {IPV6_INTERFACE}")
+        
+        # 初始化IPv6地址池
+        init_ipv6_pool()
         return True
         
     except Exception as e:
         print(f"{colors.YELLOW}[警告]{colors.RESET} 自动检测IPv6失败: {e}")
         return False
 
+def init_ipv6_pool():
+    """初始化IPv6地址池"""
+    global ipv6_addresses, max_ip_index
+    
+    ipv6_addresses = []
+    for i in range(max_ip_index):
+        ipv6_addr = f"{IPV6_PREFIX}::{i:x}"
+        ipv6_addresses.append(ipv6_addr)
+    
+    print(f"{colors.GREEN}[IPv6]{colors.RESET} 已初始化 {len(ipv6_addresses)} 个IPv6地址到池中")
+
 def get_next_ipv6():
-    """获取下一个可用的IPv6地址（线程安全）"""
+    """获取下一个可用的IPv6地址（循环使用）"""
     global current_ip_index
     
-    if not IPV6_PREFIX:
+    if not ipv6_addresses:
         return None
     
     with ipv6_lock:
-        # 生成IPv6地址的后64位（接口标识）
-        ip_suffix = current_ip_index
-        current_ip_index += 1
-        
-        # 如果超过最大索引，重新从0开始（循环使用）
-        if current_ip_index >= max_ip_index:
-            current_ip_index = 0
-            
-        # 生成完整的IPv6地址
-        ipv6_addr = f"{IPV6_PREFIX}::{ip_suffix:x}"
-        
+        ipv6_addr = ipv6_addresses[current_ip_index]
+        current_ip_index = (current_ip_index + 1) % len(ipv6_addresses)
         return ipv6_addr
 
 def check_ipv6_available():
@@ -198,7 +241,6 @@ def check_ipv6_available():
         return False
     
     try:
-        # 尝试执行IPv6 ping测试
         result = subprocess.run(
             ['ping6', '-c', '1', '2001:4860:4860::8888'],
             capture_output=True,
@@ -208,7 +250,6 @@ def check_ipv6_available():
     except:
         return False
 
-# 全局计数器（线程安全）
 class Counter:
     def __init__(self):
         self.checked = 0
@@ -227,7 +268,7 @@ class Counter:
             self.available += 1
             return self.available
     
-    def add_timeout(self, tld=None):
+    def add_timeout(self):
         with self.lock:
             self.timeout_count += 1
             return self.timeout_count
@@ -246,62 +287,62 @@ class Counter:
 counter = Counter()
 
 def check_tld_rate_limit(tld):
-    """检测指定TLD的限流情况，必要时调整该TLD的并发数和延迟"""
+    """检测指定TLD的限流情况"""
     with rate_limit_lock:
         stats = tld_stats[tld]
         
-        # 如果连续超时超过阈值，触发降速
-        if stats['consecutive_timeouts'] >= RATE_LIMIT_THRESHOLD:
+        if stats['rate_limit_count'] >= RATE_LIMIT_THRESHOLD:
             old_workers = stats['current_workers']
             old_delay = stats['current_delay']
             
-            # 降低并发数（不低于最小值）
             new_workers = max(int(old_workers * WORKER_REDUCE_FACTOR), MIN_WORKERS)
-            
-            # 增加延迟（不超过最大值）
             new_delay = min(old_delay * DELAY_INCREASE_FACTOR, MAX_DELAY)
             
-            # 更新配置
             stats['current_workers'] = new_workers
             stats['current_delay'] = new_delay
             
             print(f"\n{colors.MAGENTA}{'=' * 60}{colors.RESET}")
-            print(f"{colors.BOLD}{colors.YELLOW}[{tld}限流]{colors.RESET} 检测到连续 {stats['consecutive_timeouts']} 次超时")
+            print(f"{colors.BOLD}{colors.YELLOW}[{tld}限流降速]{colors.RESET} 检测到连续 {stats['rate_limit_count']} 次限流")
             print(f"{colors.YELLOW}调整前:{colors.RESET} 并发 {old_workers}, 延迟 {old_delay:.1f}秒")
             print(f"{colors.GREEN}调整后:{colors.RESET} 并发 {new_workers}, 延迟 {new_delay:.1f}秒")
             print(f"{colors.MAGENTA}{'=' * 60}{colors.RESET}\n")
             
-            # 重置计数器
-            stats['consecutive_timeouts'] = 0
-            
+            stats['rate_limit_count'] = 0
             return True
         return False
 
-def record_tld_timeout(tld, domain):
-    """记录指定TLD的一次超时，并检查是否需要降速"""
+def record_rate_limit(tld):
+    """记录一次限流"""
+    with rate_limit_lock:
+        stats = tld_stats[tld]
+        stats['rate_limit_count'] += 1
+        stats['consecutive_timeouts'] += 1
+        stats['total_timeouts'] += 1
+        stats['checked_count'] += 1
+        counter.add_timeout()
+        
+        check_tld_rate_limit(tld)
+
+def record_timeout(tld, domain):
+    """记录一次超时（非限流）"""
     with rate_limit_lock:
         stats = tld_stats[tld]
         stats['consecutive_timeouts'] += 1
         stats['total_timeouts'] += 1
         stats['checked_count'] += 1
-        total_timeouts = counter.add_timeout(tld)
+        counter.add_timeout()
     
-    # 记录超时域名
     with timeout_domains_lock:
         timeout_domains[tld].append(domain)
-    
-    # 每检查一定数量域名后，检测限流情况
-    if stats['checked_count'] % RATE_CHECK_INTERVAL == 0:
-        check_tld_rate_limit(tld)
 
 def get_tld_config(tld):
-    """获取指定TLD的当前配置（线程安全）"""
+    """获取指定TLD的当前配置"""
     with rate_limit_lock:
         stats = tld_stats[tld]
         return stats['current_workers'], stats['current_delay']
 
 def write_timeout_summary(output_files):
-    """在每个输出文件末尾写入超时域名总结"""
+    """写入超时总结"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     for tld, filename in output_files.items():
@@ -315,10 +356,9 @@ def write_timeout_summary(output_files):
                     f.write(f"查询完成时间: {timestamp}\n")
                     f.write(f"{'=' * 60}\n")
                     
-                    # 写入该TLD的超时域名
                     tld_timeouts = timeout_domains.get(tld, [])
                     if tld_timeouts:
-                        f.write(f"\n以下 {tld} 域名查询超时（重试{MAX_RETRIES}次仍失败）:\n")
+                        f.write(f"\n以下 {tld} 域名查询超时（换{MAX_IP_SWITCH}个IP仍失败）:\n")
                         f.write(f"{'-' * 40}\n")
                         for domain in sorted(tld_timeouts):
                             f.write(f"{domain}\n")
@@ -330,10 +370,10 @@ def write_timeout_summary(output_files):
             except Exception as e:
                 print(f"{colors.RED}[错误]{colors.RESET} 写入超时总结到 {filename} 失败: {e}")
     
-    # 同时写入一个汇总的超时文件
     try:
         with open(TIMEOUT_FILE, 'w', encoding='utf-8') as f:
             f.write(f"域名查询超时记录 - {timestamp}\n")
+            f.write(f"规则：每个域名最多换{MAX_IP_SWITCH}个IP，每个IP重试{MAX_RETRIES}次\n")
             f.write(f"{'=' * 60}\n\n")
             
             total_timeouts = 0
@@ -355,7 +395,7 @@ def write_timeout_summary(output_files):
         print(f"{colors.RED}[错误]{colors.RESET} 写入汇总超时文件失败: {e}")
 
 def load_dictionary(dict_file):
-    """从文件加载字典前缀"""
+    """加载字典文件"""
     if not os.path.exists(dict_file):
         print(f"{colors.RED}[错误]{colors.RESET} 字典文件 '{dict_file}' 不存在")
         sys.exit(1)
@@ -368,7 +408,7 @@ def load_dictionary(dict_file):
     return prefixes
 
 def load_cache():
-    """加载已检查过的域名缓存"""
+    """加载缓存"""
     if not os.path.exists(CACHE_FILE):
         return set()
     
@@ -382,7 +422,7 @@ def load_cache():
         return set()
 
 def save_to_cache(domain):
-    """将已检查域名追加到缓存（线程安全）"""
+    """保存到缓存"""
     with file_locks['cache']:
         try:
             with open(CACHE_FILE, 'a', encoding='utf-8') as f:
@@ -391,10 +431,7 @@ def save_to_cache(domain):
             print(f"{colors.RED}[错误]{colors.RESET} 写入缓存失败: {e}")
 
 def save_available(domain, output_files):
-    """
-    保存可用域名到对应的TLD文件（线程安全）
-    output_files: 字典，key为TLD，value为文件名
-    """
+    """保存可用域名"""
     tld = domain.split('.')[-1]
     if tld in output_files:
         output_file = output_files[tld]
@@ -405,21 +442,19 @@ def save_available(domain, output_files):
             except Exception as e:
                 print(f"{colors.RED}[错误]{colors.RESET} 写入结果文件 {output_file} 失败: {e}")
 
-def check_domain_with_ipv6(domain, source_ip):
+def check_domain_with_ipv6(domain, source_ip, ip_switch_count=0):
     """
     使用指定IPv6源地址查询域名
-    包含完整的防封机制和TLD级自适应限流
+    支持IP切换和智能重试
     """
     tld = domain.split('.')[-1]
     workers, delay = get_tld_config(tld)
     
     for attempt in range(MAX_RETRIES):
         try:
-            # 随机抖动 - 避免规律性请求
             jitter = random.uniform(0.1, 0.5)
             time.sleep(jitter)
             
-            # 执行WHOIS查询
             result = subprocess.run(
                 ['whois', domain],
                 capture_output=True,
@@ -428,113 +463,68 @@ def check_domain_with_ipv6(domain, source_ip):
                 env={'LANG': 'C'}
             )
             
-            output = result.stdout.lower()
+            output = result.stdout
+            output_lower = output.lower()
             
-            # === 检测限流 ===
+            # 检测限流
             limit_indicators = [
                 'limit', 'exceeded', 'denied', 'refused', 
                 'too many', 'rate limit', 'try again later',
-                'error 55000000003',  # .de 限流码
+                'error 55000000003',
                 'connection refused'
             ]
             
             for indicator in limit_indicators:
-                if indicator in output:
+                if indicator in output_lower:
                     if attempt < MAX_RETRIES - 1:
-                        # 记录限流事件
-                        record_tld_timeout(tld, domain)
+                        record_rate_limit(tld)
                         
-                        # 指数退避：被限流时等待更长时间
                         wait_time = delay * (2 ** attempt)
                         wait_time = min(wait_time, MAX_DELAY)
                         
                         print(f"{colors.YELLOW}[{tld}限流]{colors.RESET} {domain} "
-                              f"(IP: {source_ip}) 被限流，"
-                              f"等待 {wait_time:.1f}秒后重试 ({attempt+1}/{MAX_RETRIES})")
+                              f"(IP: {source_ip}) 被限流 ({attempt+1}/{MAX_RETRIES})，"
+                              f"等待 {wait_time:.1f}秒")
                         time.sleep(wait_time)
                         break
                     else:
-                        print(f"{colors.RED}[{tld}限流]{colors.RESET} {domain} "
-                              f"重试{MAX_RETRIES}次仍失败，跳过")
-                        record_tld_timeout(tld, domain)  # 记录失败
-                        return False
+                        if ip_switch_count < MAX_IP_SWITCH - 1:
+                            new_ip = get_next_ipv6()
+                            print(f"{colors.YELLOW}[{tld}IP切换]{colors.RESET} {domain} "
+                                  f"当前IP {source_ip} 重试{MAX_RETRIES}次仍限流，"
+                                  f"切换到新IP ({ip_switch_count+2}/{MAX_IP_SWITCH})")
+                            return check_domain_with_ipv6(domain, new_ip, ip_switch_count + 1)
+                        else:
+                            print(f"{colors.RED}[{tld}超时]{colors.RESET} {domain} "
+                                  f"换{MAX_IP_SWITCH}个IP仍限流，写入超时文件")
+                            record_timeout(tld, domain)
+                            return False
             
-            # ========== 规则1: 明确的未注册关键词 ==========
-            strong_available = [
-                'no match',
-                'no entries found',
-                'not found',
-                'no object found',
-                'not registered',
-                'no data found',
-                'domain is available',
-                'status: free',
-                '% not registered',
-                'no matching object',
-                'the queried object does not exist'  # .im
-            ]
+            # 使用全局关键词判断是否可用
+            is_available = check_domain_available(output)
             
-            for indicator in strong_available:
-                if indicator in output:
-                    return True
-            
-            # ========== 规则2: 明确的已注册关键词 ==========
-            strong_registered = [
-                'domain name:',
-                'registrar:',
-                'registrant name:',
-                'registrant organization:',
-                'name server:',
-                'domain status:',
-                'creation date:',
-                'expiry date:',
-                'updated date:',
-                'whois server:',
-                'referral url:'
-            ]
-            
-            for indicator in strong_registered:
-                if indicator in output:
-                    return False
-            
-            # ========== 规则3: TLD特殊规则 ==========
-            if tld == 'de' and 'status: free' in output:
-                return True
-            
-            if tld == 'im' and ('not registered' in output or 'the queried object does not exist' in output):
-                return True
-            
-            if tld == 'pw' and 'no entries found' in output:
-                return True
-            
-            # ========== 规则4: 启发式判断 ==========
-            # 如果输出非常短（<200字符），很可能是未注册
-            if len(output) < 200:
-                error_indicators = ['error', 'limit', 'denied', 'refused', 'timeout']
-                if not any(e in output for e in error_indicators):
-                    return True
-            
-            # 如果输出很长（>1000字符），几乎肯定是已注册
-            if len(output) > 1000:
-                return False
-            
-            # 默认保守判断：不可用
-            return False
+            return is_available
             
         except subprocess.TimeoutExpired:
-            # 记录超时事件
             if attempt < MAX_RETRIES - 1:
-                workers, delay = get_tld_config(tld)  # 重新获取最新配置
+                workers, delay = get_tld_config(tld)
                 wait_time = delay * (2 ** attempt)
                 wait_time = min(wait_time, MAX_DELAY)
                 print(f"{colors.YELLOW}[{tld}超时]{colors.RESET} {domain} (IP: {source_ip}) "
-                      f"查询超时，等待 {wait_time:.1f}秒后重试 ({attempt+1}/{MAX_RETRIES})")
+                      f"查询超时 ({attempt+1}/{MAX_RETRIES})，等待 {wait_time:.1f}秒")
                 time.sleep(wait_time)
             else:
-                print(f"{colors.RED}[{tld}超时]{colors.RESET} {domain} "
-                      f"重试{MAX_RETRIES}次仍超时，跳过")
-                record_tld_timeout(tld, domain)  # 记录最终超时
-                return False
+                if ip_switch_count < MAX_IP_SWITCH - 1:
+                    new_ip = get_next_ipv6()
+                    print(f"{colors.YELLOW}[{tld}IP切换]{colors.RESET} {domain} "
+                          f"当前IP {source_ip} 重试{MAX_RETRIES}次仍超时，"
+                          f"切换到新IP ({ip_switch_count+2}/{MAX_IP_SWITCH})")
+                    return check_domain_with_ipv6(domain, new_ip, ip_switch_count + 1)
+                else:
+                    print(f"{colors.RED}[{tld}超时]{colors.RESET} {domain} "
+                          f"换{MAX_IP_SWITCH}个IP仍超时，写入超时文件")
+                    record_timeout(tld, domain)
+                    return False
                 
         except Exception as e:
             if attempt < MAX_RETRIES - 1:
@@ -545,30 +535,33 @@ def check_domain_with_ipv6(domain, source_ip):
                       f"等待 {wait_time:.1f}秒后重试 ({attempt+1}/{MAX_RETRIES})")
                 time.sleep(wait_time)
             else:
-                print(f"{colors.RED}[{tld}错误]{colors.RESET} {domain} - {str(e)[:50]}，"
-                      f"重试{MAX_RETRIES}次失败，跳过")
-                record_tld_timeout(tld, domain)  # 记录错误
-                return False
+                if ip_switch_count < MAX_IP_SWITCH - 1:
+                    new_ip = get_next_ipv6()
+                    print(f"{colors.YELLOW}[{tld}IP切换]{colors.RESET} {domain} "
+                          f"当前IP {source_ip} 重试{MAX_RETRIES}次仍错误，"
+                          f"切换到新IP ({ip_switch_count+2}/{MAX_IP_SWITCH})")
+                    return check_domain_with_ipv6(domain, new_ip, ip_switch_count + 1)
+                else:
+                    print(f"{colors.RED}[{tld}错误]{colors.RESET} {domain} "
+                          f"换{MAX_IP_SWITCH}个IP仍失败，写入超时文件")
+                    record_timeout(tld, domain)
+                    return False
     
     return False
 
 def worker(domain, output_files):
-    """单个域名查询工作线程（使用不同IPv6源地址）"""
+    """工作线程"""
     tld = domain.split('.')[-1]
     
-    # 为这个线程分配一个IPv6源地址
     source_ip = get_next_ipv6() if USE_IPV6 else "IPv6禁用"
     
     try:
-        is_available = check_domain_with_ipv6(domain, source_ip)
+        is_available = check_domain_with_ipv6(domain, source_ip, 0)
     except Exception as e:
         print(f"{colors.RED}[严重错误]{colors.RESET} {domain}: {e}")
         is_available = False
     
-    # 保存到缓存（无论是否可用）
     save_to_cache(domain)
-    
-    # 更新计数器
     checked = counter.add_checked()
     
     if is_available:
@@ -579,10 +572,8 @@ def worker(domain, output_files):
         available = counter.available
         status = f"{colors.RED}不可用{colors.RESET}"
     
-    # 获取当前TLD的配置用于显示
     workers, delay = get_tld_config(tld)
     
-    # 打印进度（每10个或发现可用时打印）
     if checked % 10 == 0 or is_available:
         speed = counter.get_speed()
         elapsed = time.time() - counter.start_time
@@ -601,10 +592,10 @@ def worker(domain, output_files):
               f"{colors.MAGENTA}{tld}{colors.RESET}:{domain} {ip_info} - {status} "
               f"(可用: {colors.GREEN}{available}{colors.RESET}"
               f"{colors.CYAN}{eta_str}{colors.RESET}) "
-              f"[{tld}并发:{workers} 延迟:{delay:.1f}s 总超时:{timeouts}]")
+              f"[{tld}并发:{workers} 延迟:{delay:.1f}s 超时:{timeouts}]")
 
 def init_ipv6():
-    """初始化IPv6配置"""
+    """初始化IPv6"""
     global USE_IPV6, IPV6_PREFIX, IPV6_INTERFACE
     
     if not USE_IPV6:
@@ -612,17 +603,14 @@ def init_ipv6():
     
     print(f"{colors.CYAN}[IPv6]{colors.RESET} 正在自动检测IPv6配置...")
     
-    # 自动检测IPv6前缀和网卡
     if not detect_ipv6_prefix():
         print(f"{colors.YELLOW}[警告]{colors.RESET} 自动检测IPv6失败，将使用普通模式")
         USE_IPV6 = False
         return False
     
-    # 检查IPv6网络是否可用
     if not check_ipv6_available():
         print(f"{colors.YELLOW}[警告]{colors.RESET} IPv6网络可能不可用，将尝试继续")
     
-    # 检查是否已有IPv6地址
     result = subprocess.run(
         ['ip', '-6', 'addr', 'show', 'dev', IPV6_INTERFACE], 
         capture_output=True, 
@@ -641,9 +629,9 @@ def init_ipv6():
 
 def main():
     global total_domains, max_ip_index, BASE_DELAY, MAX_DELAY, REQUEST_TIMEOUT, MAX_RETRIES, USE_IPV6
-    global tld_stats
+    global tld_stats, MIN_WORKERS, RATE_LIMIT_THRESHOLD, MAX_IP_SWITCH
     
-    parser = argparse.ArgumentParser(description='高性能域名批量查询工具 - IPv6多IP并发版（TLD级自适应限流）')
+    parser = argparse.ArgumentParser(description='高性能域名批量查询工具 - IPv6多IP并发版（全局特征码匹配）')
     parser.add_argument('dictionary', help='字典文件路径 (每行一个前缀)')
     parser.add_argument('--tld', nargs='+', default=TLDS, 
                        help=f'指定TLD，默认: {TLDS}')
@@ -658,11 +646,13 @@ def main():
     parser.add_argument('--timeout', type=int, default=REQUEST_TIMEOUT,
                        help=f'查询超时(秒)，默认: {REQUEST_TIMEOUT}')
     parser.add_argument('--retries', type=int, default=MAX_RETRIES,
-                       help=f'最大重试次数，默认: {MAX_RETRIES}')
+                       help=f'每个IP最大重试次数，默认: {MAX_RETRIES}')
     parser.add_argument('--max-ips', type=int, default=1000,
                        help=f'最大使用IPv6数量，默认: 1000')
+    parser.add_argument('--ip-switch', type=int, default=MAX_IP_SWITCH,
+                       help=f'最大IP切换次数，默认: {MAX_IP_SWITCH}')
     parser.add_argument('--threshold', type=int, default=RATE_LIMIT_THRESHOLD,
-                       help=f'限流触发阈值（连续超时次数），默认: {RATE_LIMIT_THRESHOLD}')
+                       help=f'限流触发阈值，默认: {RATE_LIMIT_THRESHOLD}')
     parser.add_argument('--no-ipv6', action='store_true',
                        help='禁用IPv6多IP功能')
     parser.add_argument('--no-cache', action='store_true',
@@ -671,16 +661,13 @@ def main():
                        help='强制不使用颜色')
     args = parser.parse_args()
     
-    # 根据字典名生成基础文件名
     dict_name = os.path.splitext(os.path.basename(args.dictionary))[0]
     tlds = args.tld
     
-    # 为每个TLD生成独立的输出文件
     output_files = {}
     for tld in tlds:
         output_files[tld] = f"{dict_name}-{tld}可注册.txt"
     
-    # 更新配置
     MIN_WORKERS = args.min_workers
     RATE_LIMIT_THRESHOLD = args.threshold
     max_ip_index = args.max_ips
@@ -688,8 +675,8 @@ def main():
     MAX_DELAY = args.max_delay
     REQUEST_TIMEOUT = args.timeout
     MAX_RETRIES = args.retries
+    MAX_IP_SWITCH = args.ip_switch
     
-    # 初始化每个TLD的配置
     for tld in tlds:
         tld_stats[tld]['current_workers'] = args.workers
         tld_stats[tld]['current_delay'] = BASE_DELAY
@@ -701,13 +688,12 @@ def main():
         colors.supported = False
         colors.__init__()
     
-    max_workers = args.workers  # 初始并发数
+    max_workers = args.workers
     use_cache = not args.no_cache
     
-    # 打印配置
     separator = f"{colors.BLUE}{'=' * 80}{colors.RESET}"
     print(separator)
-    print(f"{colors.BOLD}{colors.CYAN}高性能域名批量查询工具 - IPv6多IP并发版（TLD级自适应限流）{colors.RESET}")
+    print(f"{colors.BOLD}{colors.CYAN}高性能域名批量查询工具 - IPv6多IP并发版（全局特征码匹配）{colors.RESET}")
     print(f"{colors.YELLOW}字典文件:{colors.RESET} {args.dictionary}")
     print(f"{colors.YELLOW}输出文件:{colors.RESET}")
     for tld, filename in output_files.items():
@@ -715,24 +701,22 @@ def main():
     print(f"{colors.YELLOW}查询TLD:{colors.RESET} {tlds}")
     print(f"{colors.YELLOW}初始并发:{colors.RESET} {max_workers} (每个TLD独立)")
     print(f"{colors.YELLOW}最小并发:{colors.RESET} {MIN_WORKERS}")
-    print(f"{colors.YELLOW}限流阈值:{colors.RESET} {RATE_LIMIT_THRESHOLD}次超时")
+    print(f"{colors.YELLOW}限流阈值:{colors.RESET} {RATE_LIMIT_THRESHOLD}次连续限流")
     print(f"{colors.YELLOW}最大IPv6数:{colors.RESET} {max_ip_index}")
+    print(f"{colors.YELLOW}每个IP重试:{colors.RESET} {MAX_RETRIES}次")
+    print(f"{colors.YELLOW}最大IP切换:{colors.RESET} {MAX_IP_SWITCH}次")
     print(f"{colors.YELLOW}基础延迟:{colors.RESET} {BASE_DELAY}秒 (每个TLD独立)")
     print(f"{colors.YELLOW}最大延迟:{colors.RESET} {MAX_DELAY}秒")
     print(f"{colors.YELLOW}查询超时:{colors.RESET} {REQUEST_TIMEOUT}秒")
-    print(f"{colors.YELLOW}最大重试:{colors.RESET} {MAX_RETRIES}次")
     print(f"{colors.YELLOW}使用缓存:{colors.RESET} {use_cache}")
     print(separator)
     
-    # 初始化IPv6
     if USE_IPV6:
         USE_IPV6 = init_ipv6()
     
-    # 加载数据
     prefixes = load_dictionary(args.dictionary)
     cached = load_cache() if use_cache else set()
     
-    # 生成查询列表
     all_domains = []
     for prefix in prefixes:
         for tld in tlds:
@@ -748,29 +732,23 @@ def main():
         print(f"{colors.YELLOW}[提示]{colors.RESET} 所有域名都已缓存，无需查询")
         return
     
-    # 开始多线程查询
     print(f"{colors.CYAN}启动 {max_workers} 个线程并发查询...{colors.RESET}\n")
     start_time = time.time()
     
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # 提交所有任务，传入输出文件字典
             futures = [executor.submit(worker, domain, output_files) for domain in all_domains]
-            
-            # 等待所有完成
             for future in as_completed(futures):
-                future.result()  # 如果有异常会在这里抛出
+                future.result()
     
     except KeyboardInterrupt:
         print(f"\n\n{colors.RED}[警告]{colors.RESET} 用户中断，正在等待当前任务完成...")
-        # ThreadPoolExecutor 会在上下文退出时自动等待
     
     finally:
         total_time = time.time() - start_time
         checked, available, timeouts = counter.get()
         speed = checked / total_time if total_time > 0 else 0
         
-        # 写入超时总结到各个输出文件
         write_timeout_summary(output_files)
         
         print("\n" + separator)
